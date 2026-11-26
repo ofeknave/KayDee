@@ -1,22 +1,177 @@
-/* היום שלי — קלוריות, הרגלים ותזכורות. כל הנתונים נשמרים במכשיר (localStorage). */
+/* היום שלי — קלוריות, הרגלים, מים ותזכורות. נשמר בדפדפן, ועם חשבון (Firebase) — גם בענן. */
 (function () {
   'use strict';
 
   // ---------- Storage ----------
-  const KEY = 'daily-app-v1';
-  const defaults = { calorieGoal: 2000, foods: [], habits: [], reminders: [] };
+  // נשמר מקומית בדפדפן, ואם המשתמש מחובר — גם בחשבון שלו (Firebase) ומסונכרן בין מכשירים.
+  const BASE_KEY = 'daily-app-v1';
+  const defaults = () => ({
+    tasks: [], taskLists: [],
+    foods: [], habits: [], reminders: [], customFoods: [], favorites: [], weights: {},
+    goals: { kcal: 2000, pPct: 25, cPct: 45, fPct: 30, fib: 28, sug: 50, na: 2300, profile: null },
+    water: { goal: 8, cupMl: 250, log: {}, remind: { on: false, every: 60, from: '08:00', to: '22:00', last: 0 } },
+  });
+  let localKey = BASE_KEY;
   let state = load();
 
+  function normalize(s) {
+    const d = defaults();
+    const out = Object.assign(d, s || {});
+    out.goals = Object.assign(defaults().goals, out.goals || {});
+    if (s && s.calorieGoal && !(s.goals && s.goals.kcal)) out.goals.kcal = s.calorieGoal; // מעבר מגרסה קודמת
+    delete out.calorieGoal;
+    out.water = Object.assign(defaults().water, out.water || {});
+    out.water.remind = Object.assign(defaults().water.remind, out.water.remind || {});
+    return out;
+  }
   function load() {
     try {
-      const raw = localStorage.getItem(KEY);
-      return raw ? Object.assign({}, defaults, JSON.parse(raw)) : structuredClone(defaults);
+      const raw = localStorage.getItem(localKey) || (localKey !== BASE_KEY ? localStorage.getItem(BASE_KEY) : null);
+      return normalize(raw ? JSON.parse(raw) : null);
     } catch (e) {
-      return structuredClone(defaults);
+      return normalize(null);
     }
   }
   function save() {
-    try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) { /* storage unavailable */ }
+    try { localStorage.setItem(localKey, JSON.stringify(state)); } catch (e) { /* storage unavailable */ }
+    queueCloudSave();
+  }
+
+  // ---------- Account / cloud sync (Firebase) ----------
+  // ההגדרות נמצאות ב־firebase-config.js. בלי הגדרות — האתר עובד במצב מקומי (localStorage).
+  const FB_VER = '10.14.1';
+  const account = { status: 'loading', user: null, fb: null, docRef: null, unsub: null, lastSync: 0, error: '' };
+  let cloudTimer = null, cloudWriting = false, cloudDirty = false, lastCloudJson = '';
+  let authTab = 'login', authBusy = false, authEmail = '', authName = '';
+
+  function queueCloudSave() {
+    if (!account.docRef) return;
+    cloudDirty = true;
+    clearTimeout(cloudTimer);
+    cloudTimer = setTimeout(flushCloud, 800);
+  }
+  async function flushCloud() {
+    if (!account.docRef || cloudWriting || !cloudDirty) return;
+    cloudWriting = true;
+    cloudDirty = false;
+    const json = JSON.stringify(state);
+    const ref = account.docRef;
+    try {
+      if (json !== lastCloudJson) {
+        await account.fb.fs.setDoc(ref, { json, updatedAt: Date.now() });
+        lastCloudJson = json;
+        account.lastSync = Date.now();
+        account.error = '';
+      }
+    } catch (e) {
+      account.error = 'השמירה בחשבון נכשלה — ננסה שוב (הנתונים שמורים בדפדפן)';
+      if (account.docRef === ref) { cloudDirty = true; setTimeout(flushCloud, 5000); }
+    } finally {
+      cloudWriting = false;
+      if (cloudDirty) queueCloudSave();
+      if (currentRoute() === 'account') render();
+    }
+  }
+
+  async function initAccount() {
+    const cfg = window.FIREBASE_CONFIG;
+    if (!cfg || !cfg.apiKey) { account.status = 'unconfigured'; refreshAccountUI(); return; }
+    try {
+      const base = `https://www.gstatic.com/firebasejs/${FB_VER}/`;
+      const [appM, authM, fs] = await Promise.all([import(base + 'firebase-app.js'), import(base + 'firebase-auth.js'), import(base + 'firebase-firestore.js')]);
+      const app = appM.initializeApp(cfg);
+      const auth = authM.getAuth(app);
+      auth.languageCode = 'he';
+      account.fb = { auth, authM, fs, db: fs.getFirestore(app) };
+      authM.getRedirectResult(auth).catch((e) => { account.error = authError(e); refreshAccountUI(); });
+      authM.onAuthStateChanged(auth, onUser);
+    } catch (e) {
+      account.status = 'error';
+      account.error = 'לא הצלחנו לטעון את מערכת החשבונות — העבודה נשמרת מקומית';
+      refreshAccountUI();
+    }
+  }
+
+  async function onUser(u) {
+    if (account.unsub) { account.unsub(); account.unsub = null; }
+    if (cloudDirty && account.docRef) { clearTimeout(cloudTimer); await flushCloud(); }
+    account.user = u;
+    lastCloudJson = '';
+    authTab = 'login';
+    if (!u) {
+      account.docRef = null;
+      account.status = 'guest';
+      localKey = BASE_KEY;
+      state = load();
+      render();
+      return;
+    }
+    const { fs, db } = account.fb;
+    const browserState = state;
+    account.docRef = fs.doc(db, 'users', u.uid);
+    localKey = BASE_KEY + ':' + u.uid;
+    account.status = 'loading';
+    refreshAccountUI();
+    try {
+      const snap = await fs.getDoc(account.docRef);
+      const remote = snap.exists() ? snap.data() : null;
+      if (remote && remote.json) {
+        lastCloudJson = remote.json;
+        state = normalize(JSON.parse(remote.json));
+        try { localStorage.setItem(localKey, remote.json); } catch (e) { /* ignore */ }
+      } else {
+        state = browserState; // חשבון חדש: מעבירים אליו את מה שכבר נשמר בדפדפן
+        save();
+      }
+      account.status = 'connected';
+      account.lastSync = Date.now();
+      account.error = '';
+      const ref = account.docRef;
+      account.unsub = fs.onSnapshot(ref, (s) => {
+        const d = s.exists() ? s.data() : null;
+        if (account.docRef !== ref || !d || !d.json || d.json === lastCloudJson || cloudDirty || cloudWriting) return;
+        lastCloudJson = d.json;
+        state = normalize(JSON.parse(d.json));
+        try { localStorage.setItem(localKey, d.json); } catch (e) { /* ignore */ }
+        account.lastSync = Date.now();
+        render();
+      }, () => {});
+    } catch (e) {
+      account.status = 'error';
+      account.error = 'לא הצלחנו לטעון את הנתונים מהחשבון — העבודה נשמרת בדפדפן';
+      state = load();
+    }
+    render();
+  }
+
+  const AUTH_ERRORS = {
+    'auth/invalid-email': 'כתובת המייל לא תקינה',
+    'auth/missing-email': 'נא להזין מייל',
+    'auth/missing-password': 'נא להזין סיסמה',
+    'auth/weak-password': 'הסיסמה צריכה להכיל לפחות 6 תווים',
+    'auth/email-already-in-use': 'כבר יש חשבון עם המייל הזה — נסו להתחבר',
+    'auth/invalid-credential': 'המייל או הסיסמה שגויים',
+    'auth/invalid-login-credentials': 'המייל או הסיסמה שגויים',
+    'auth/wrong-password': 'המייל או הסיסמה שגויים',
+    'auth/user-not-found': 'לא נמצא חשבון עם המייל הזה',
+    'auth/too-many-requests': 'יותר מדי ניסיונות. נסו שוב בעוד כמה דקות',
+    'auth/popup-closed-by-user': 'חלון ההתחברות נסגר',
+    'auth/cancelled-popup-request': 'חלון ההתחברות נסגר',
+    'auth/network-request-failed': 'אין חיבור לאינטרנט',
+    'auth/operation-not-allowed': 'שיטת ההתחברות הזו לא הופעלה ב־Firebase',
+    'auth/unauthorized-domain': 'הכתובת של האתר לא מאושרת ב־Firebase (Authentication → Settings → Authorized domains)',
+    'auth/requires-recent-login': 'מטעמי אבטחה צריך להתחבר מחדש ואז לנסות שוב',
+  };
+  const authError = (e) => AUTH_ERRORS[e && e.code] || 'משהו השתבש, נסו שוב';
+
+  function updateChip() {
+    const chip = $('#accountChip');
+    if (!chip) return;
+    chip.textContent = account.status === 'connected' ? '☁️ מסונכרן' : account.status === 'loading' ? '…' : account.status === 'guest' ? '🔑 התחברות' : '📱 מקומי';
+  }
+  function refreshAccountUI() {
+    updateChip();
+    if (currentRoute() === 'account') render();
   }
 
   // ---------- Helpers ----------
@@ -50,36 +205,96 @@
     toastTimer = setTimeout(() => el.classList.remove('show'), 2200);
   }
 
+  // ---------- Notifications ----------
+  function notify(title, body, tag) {
+    let shown = false;
+    try {
+      if ('Notification' in window && Notification.permission === 'granted') {
+        try { new Notification(title, { body, icon: 'icon.svg', tag }); shown = true; } catch (e) { /* mobile requires SW */ }
+        if (!shown && navigator.serviceWorker) {
+          navigator.serviceWorker.ready.then((reg) => reg.showNotification(title, { body, icon: 'icon.svg', tag })).catch(() => {});
+        }
+      }
+    } catch (e) { /* notifications unavailable */ }
+    toast(title);
+    try { if (navigator.vibrate && (!navigator.userActivation || navigator.userActivation.hasBeenActive)) navigator.vibrate([200, 100, 200]); } catch (e) { /* ignore */ }
+  }
+
+  // ---------- Bottom sheet helper ----------
+  function makeSheet(id, onAction, onClose) {
+    let el = null;
+    const api = {
+      box() {
+        if (!el) {
+          el = document.createElement('div');
+          el.id = id;
+          el.className = 'sheet-wrap';
+          el.innerHTML = '<div class="sheet" role="dialog" aria-modal="true"></div>';
+          document.body.appendChild(el);
+          el.addEventListener('click', (e) => { if (e.target === el) api.close(); else onAction(e); });
+          document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && api.isOpen()) api.close(); });
+        }
+        return el.firstChild;
+      },
+      open() { api.box(); el.classList.add('open'); document.body.classList.add('no-scroll'); return el.firstChild; },
+      close() { if (!el || !api.isOpen()) return; el.classList.remove('open'); document.body.classList.remove('no-scroll'); if (onClose) onClose(); },
+      isOpen() { return !!el && el.classList.contains('open'); },
+    };
+    return api;
+  }
+
+  // ---------- Modules (calories.js, habits.js, reminders.js) ----------
+  const modCtx = {
+    $, esc, uid, dayKey, addDays, parseDay, fmtDay, DAYS, toast, notify, makeSheet, view: $('#view'),
+    state: () => state, save: () => save(), render: () => render(),
+  };
+  const cal = window.CaloriesModule(modCtx);
+  const habitsMod = window.HabitsModule(modCtx);
+  const remMod = window.RemindersModule(modCtx);
+  const tasksMod = window.TasksModule(modCtx);
+  Object.assign(modCtx, { rem: remMod, habits: habitsMod, cal, tasks: tasksMod });
+  const calendarMod = window.CalendarModule(modCtx);
+
   // ---------- Router ----------
   const view = $('#view');
   const routes = {
     '': { title: 'היום שלי', render: renderHome },
-    calories: { title: '🔥 קלוריות', render: renderCalories },
-    habits: { title: '✅ הרגלים', render: renderHabits },
-    reminders: { title: '⏰ תזכורות', render: renderReminders },
+    calories: { title: '🔥 קלוריות ותזונה', render: () => cal.render(subRoute()) },
+    habits: { title: '✅ הרגלים', render: () => habitsMod.render() },
+    water: { title: '💧 שתיית מים', render: renderWater },
+    reminders: { title: '⏰ תזכורות', render: () => remMod.render() },
+    calendar: { title: '📅 לוח שנה', render: () => calendarMod.render() },
+    tasks: { title: '📋 משימות', render: () => tasksMod.render() },
+    account: { title: '👤 חשבון', render: renderAccount },
   };
   function currentRoute() {
-    const r = location.hash.replace(/^#\/?/, '');
+    const r = location.hash.replace(/^#\/?/, '').split('/')[0];
     return routes[r] ? r : '';
   }
+  const subRoute = () => location.hash.replace(/^#\/?/, '').split('/')[1] || '';
   function render() {
     const r = currentRoute();
     $('#pageTitle').textContent = routes[r].title;
     $('#backBtn').hidden = r === '';
     document.querySelectorAll('#tabbar a').forEach((a) => a.classList.toggle('active', a.dataset.route === r));
     routes[r].render();
+    closeDrawer();
+    updateChip();
   }
-  window.addEventListener('hashchange', () => { render(); window.scrollTo(0, 0); });
+  window.addEventListener('hashchange', () => { cal.close(); habitsMod.close(); remMod.close(); tasksMod.close(); render(); window.scrollTo(0, 0); });
   $('#backBtn').addEventListener('click', () => { location.hash = '#/'; });
+
+  // ---------- Side menu (☰) ----------
+  function openDrawer() { $('#drawer').classList.add('open'); $('#scrim').hidden = false; $('#menuBtn').setAttribute('aria-expanded', 'true'); }
+  function closeDrawer() { $('#drawer').classList.remove('open'); $('#scrim').hidden = true; $('#menuBtn').setAttribute('aria-expanded', 'false'); }
+  $('#menuBtn').addEventListener('click', () => ($('#drawer').classList.contains('open') ? closeDrawer() : openDrawer()));
+  $('#scrim').addEventListener('click', closeDrawer);
+  $('#drawer').addEventListener('click', (e) => { if (e.target.closest('a')) closeDrawer(); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeDrawer(); });
 
   // ---------- Home ----------
   function renderHome() {
     const today = dayKey();
-    const eaten = state.foods.filter((f) => f.day === today).reduce((s, f) => s + f.kcal, 0);
-    const doneHabits = state.habits.filter((h) => h.done.includes(today)).length;
-    const pending = state.reminders.filter((r) => !r.done);
-    const sorted = pending.slice().sort((a, b) => a.at - b.at);
-    const next = sorted.find((r) => r.at > Date.now()) || sorted[0];
     const hour = new Date().getHours();
     const hello = hour < 12 ? 'בוקר טוב ☀️' : hour < 18 ? 'צהריים טובים 🌤️' : 'ערב טוב 🌙';
 
@@ -88,288 +303,246 @@
       <div class="menu">
         <a class="menu-card c-cal" href="#/calories">
           <div class="emoji">🔥</div>
-          <div><h2>קלוריות</h2><p>${eaten} מתוך ${state.calorieGoal} קק״ל היום</p></div>
+          <div><h2>קלוריות</h2><p>${cal.homeSummary()}</p></div>
           <span class="arrow">‹</span>
         </a>
         <a class="menu-card c-hab" href="#/habits">
           <div class="emoji">✅</div>
-          <div><h2>הרגלים</h2><p>${state.habits.length ? `${doneHabits} מתוך ${state.habits.length} הושלמו היום` : 'עוד לא הוספת הרגלים'}</p></div>
+          <div><h2>הרגלים</h2><p>${habitsMod.homeSummary()}</p></div>
+          <span class="arrow">‹</span>
+        </a>
+        <a class="menu-card c-wat" href="#/water">
+          <div class="emoji">💧</div>
+          <div><h2>שתיית מים</h2><p>${waterToday()} מתוך ${state.water.goal} כוסות היום${state.water.remind.on ? ' · 🔔 תזכורת פעילה' : ''}</p></div>
+          <span class="arrow">‹</span>
+        </a>
+        <a class="menu-card c-calnd" href="#/calendar">
+          <div class="emoji">📅</div>
+          <div><h2>לוח שנה</h2><p>${calendarMod.homeSummary()}</p></div>
+          <span class="arrow">‹</span>
+        </a>
+        <a class="menu-card c-task" href="#/tasks">
+          <div class="emoji">📋</div>
+          <div><h2>משימות</h2><p>${tasksMod.homeSummary()}</p></div>
           <span class="arrow">‹</span>
         </a>
         <a class="menu-card c-rem" href="#/reminders">
           <div class="emoji">⏰</div>
-          <div><h2>תזכורות</h2><p>${next ? `הבאה: ${esc(next.title)} (${fmtDateTime(next.at)})` : 'אין תזכורות פתוחות'}</p></div>
+          <div><h2>תזכורות</h2><p>${remMod.homeSummary()}</p></div>
           <span class="arrow">‹</span>
         </a>
       </div>`;
   }
 
-  // ---------- Calories ----------
-  let calDay = dayKey();
-  const MEALS = ['בוקר', 'צהריים', 'ערב', 'נשנוש'];
-  const QUICK = [['תפוח', 80], ['בננה', 105], ['ביצה', 75], ['פרוסת לחם', 80], ['יוגורט', 120], ['קפה עם חלב', 60]];
+  // ---------- Water ----------
+  const waterToday = () => state.water.log[dayKey()] || 0;
+  const toMin = (hhmm) => { const [h, m] = String(hhmm).split(':').map(Number); return h * 60 + (m || 0); };
 
-  function guessMeal() {
-    const h = new Date().getHours();
-    return h < 11 ? 'בוקר' : h < 16 ? 'צהריים' : h < 21 ? 'ערב' : 'נשנוש';
-  }
-
-  function renderCalories() {
-    const items = state.foods.filter((f) => f.day === calDay);
-    const total = items.reduce((s, f) => s + f.kcal, 0);
-    const goal = state.calorieGoal || 1;
-    const left = state.calorieGoal - total;
-    const C = 2 * Math.PI * 50;
-    const pct = Math.min(total / goal, 1);
-    const byMeal = MEALS.map((m) => [m, items.filter((f) => f.meal === m)]).filter(([, l]) => l.length);
-
-    view.innerHTML = `
-      <div class="date-nav">
-        <button class="icon-btn" data-act="next-day" aria-label="יום הבא">›</button>
-        <strong>${fmtDay(calDay)}</strong>
-        <button class="icon-btn" data-act="prev-day" aria-label="יום קודם">‹</button>
-      </div>
-
-      <div class="card">
-        <div class="summary">
-          <svg class="ring ${left < 0 ? 'over' : ''}" viewBox="0 0 120 120">
-            <circle class="track" cx="60" cy="60" r="50"/>
-            <circle class="bar" cx="60" cy="60" r="50" transform="rotate(-90 60 60)"
-              stroke-dasharray="${C}" stroke-dashoffset="${C * (1 - pct)}"/>
-            <text x="60" y="62">${total}</text>
-            <text class="lbl" x="60" y="80">קק״ל</text>
-          </svg>
-          <div class="stats">
-            <div><span class="muted">יעד</span><strong>${state.calorieGoal}</strong></div>
-            <div><span class="muted">נאכל</span><strong>${total}</strong></div>
-            <div><span class="muted">${left >= 0 ? 'נשאר' : 'חריגה'}</span><strong style="color:${left >= 0 ? 'var(--hab)' : 'var(--danger)'}">${Math.abs(left)}</strong></div>
-          </div>
-        </div>
-        <form class="goal-edit" id="goalForm">
-          <span class="muted">יעד יומי:</span>
-          <input type="number" name="goal" min="500" max="10000" value="${state.calorieGoal}" inputmode="numeric">
-          <button class="btn ghost small">עדכון</button>
-        </form>
-      </div>
-
-      <div class="card">
-        <h3>הוספת מאכל</h3>
-        <form id="foodForm">
-          <div class="row">
-            <input name="name" placeholder="מה אכלת?" required maxlength="60">
-            <input name="kcal" type="number" placeholder="קלוריות" min="0" max="5000" required inputmode="numeric">
-          </div>
-          <div class="row" style="margin-top:8px">
-            <select name="meal">${MEALS.map((m) => `<option ${m === guessMeal() ? 'selected' : ''}>${m}</option>`).join('')}</select>
-            <button class="btn">+ הוספה</button>
-          </div>
-        </form>
-        <div class="quick">${QUICK.map(([n, k]) => `<button class="chip" data-act="quick" data-name="${n}" data-kcal="${k}">${n} · ${k}</button>`).join('')}</div>
-      </div>
-
-      <div class="card">
-        <h3>מה אכלתי</h3>
-        ${items.length ? byMeal.map(([meal, list]) => `
-          <div class="section-label">${meal} · ${list.reduce((s, f) => s + f.kcal, 0)} קק״ל</div>
-          <ul class="list">${list.map((f) => `
-            <li>
-              <span class="meal-tag">${f.meal}</span>
-              <span class="grow title">${esc(f.name)}</span>
-              <span class="kcal">${f.kcal}</span>
-              <button class="del" data-act="del-food" data-id="${f.id}" aria-label="מחיקה">✕</button>
-            </li>`).join('')}
-          </ul>`).join('') : '<p class="empty">עוד לא נרשם כלום ליום הזה 🍽️</p>'}
-      </div>`;
-
-    $('#goalForm').addEventListener('submit', (e) => {
-      e.preventDefault();
-      const v = parseInt(e.target.goal.value, 10);
-      if (v > 0) { state.calorieGoal = v; save(); renderCalories(); toast('היעד עודכן'); }
-    });
-    $('#foodForm').addEventListener('submit', (e) => {
-      e.preventDefault();
-      const f = e.target;
-      addFood(f.name.value.trim(), parseInt(f.kcal.value, 10), f.meal.value);
-    });
-  }
-
-  function addFood(name, kcal, meal) {
-    if (!name || !(kcal >= 0)) return;
-    state.foods.push({ id: uid(), day: calDay, name, kcal, meal: meal || guessMeal() });
-    save();
-    renderCalories();
-    toast(`נוסף: ${name} (${kcal} קק״ל)`);
-  }
-
-  // ---------- Habits ----------
-  const HABIT_EMOJIS = ['💧', '🏃', '📚', '🧘', '🥗', '😴', '🦷', '💊', '✍️', '🚶'];
-
-  function streak(h) {
-    let k = dayKey();
-    if (!h.done.includes(k)) k = addDays(k, -1); // היום עוד לא נגמר
-    let n = 0;
-    while (h.done.includes(k)) { n++; k = addDays(k, -1); }
-    return n;
-  }
-
-  function renderHabits() {
+  function renderWater() {
+    const w = state.water;
     const today = dayKey();
-    const done = state.habits.filter((h) => h.done.includes(today)).length;
-    const total = state.habits.length;
+    const n = waterToday();
+    const pct = Math.min(n / (w.goal || 1), 1);
     const week = Array.from({ length: 7 }, (_, i) => addDays(today, i - 6));
+    const max = Math.max(w.goal, ...week.map((d) => w.log[d] || 0), 1);
+    const canNotify = 'Notification' in window;
 
     view.innerHTML = `
-      ${total ? `
-      <div class="card">
-        <div class="row" style="justify-content:space-between;align-items:center">
-          <strong style="flex:none">התקדמות היום</strong>
-          <span class="muted" style="flex:none">${done}/${total}</span>
+      <div class="card water-hero">
+        <div class="glass" aria-hidden="true"><div class="fill" style="height:${pct * 100}%"></div><span>${Math.round(pct * 100)}%</span></div>
+        <div class="water-info">
+          <div class="big">${n} <small>/ ${w.goal} כוסות</small></div>
+          <div class="muted">${((n * w.cupMl) / 1000).toFixed(2).replace(/\.?0+$/, '')} ליטר מתוך ${((w.goal * w.cupMl) / 1000).toFixed(2).replace(/\.?0+$/, '')}</div>
+          ${n >= w.goal ? '<div class="good">הגעת ליעד היום! 🎉</div>' : `<div class="muted">נשארו ${w.goal - n} כוסות</div>`}
+          <div class="row" style="margin-top:12px">
+            <button class="btn water-btn" data-act="water-add">+ כוס מים</button>
+            <button class="btn ghost" data-act="water-sub" style="flex:0 0 52px" aria-label="הורדת כוס" ${n ? '' : 'disabled'}>−</button>
+          </div>
         </div>
-        <div class="progress"><div style="width:${(done / total) * 100}%"></div></div>
-        ${done === total ? '<p class="muted" style="margin:10px 0 0">כל ההרגלים הושלמו היום! 🎉</p>' : ''}
-      </div>` : ''}
-
-      <div class="card">
-        <h3>ההרגלים שלי</h3>
-        ${total ? `<ul class="list">${state.habits.map((h) => {
-          const isDone = h.done.includes(today);
-          const s = streak(h);
-          return `
-          <li class="habit">
-            <button class="check ${isDone ? 'done' : ''}" data-act="toggle-habit" data-id="${h.id}" aria-label="סימון">${isDone ? '✓' : esc(h.emoji)}</button>
-            <div class="grow">
-              <div class="title">${esc(h.emoji)} ${esc(h.name)}</div>
-              <div class="week">${week.map((d) => `<span class="${h.done.includes(d) ? 'on' : ''}" title="${d}">${DAYS[parseDay(d).getDay()]}</span>`).join('')}</div>
-            </div>
-            ${s ? `<span class="streak">🔥 ${s}</span>` : ''}
-            <button class="del" data-act="del-habit" data-id="${h.id}" aria-label="מחיקה">✕</button>
-          </li>`;
-        }).join('')}</ul>` : '<p class="empty">הוסף/י הרגל ראשון כדי להתחיל 🌱</p>'}
       </div>
 
       <div class="card">
-        <h3>הרגל חדש</h3>
-        <form id="habitForm">
-          <div class="row">
-            <select name="emoji" style="flex:0 0 76px">${HABIT_EMOJIS.map((e) => `<option>${e}</option>`).join('')}</select>
-            <input name="name" placeholder="למשל: לשתות 8 כוסות מים" required maxlength="50">
-          </div>
-          <button class="btn" style="margin-top:8px;width:100%">+ הוספת הרגל</button>
+        <h3>🔔 תזכורת לשתות</h3>
+        <label class="switch-row">
+          <span>תזכורת פעילה</span>
+          <input type="checkbox" id="wRemOn" ${w.remind.on ? 'checked' : ''}>
+        </label>
+        <div class="row" style="margin-top:10px">
+          <label class="field"><span>כל</span>
+            <select id="wEvery">${[30, 45, 60, 90, 120, 180].map((m) => `<option value="${m}" ${w.remind.every === m ? 'selected' : ''}>${m < 60 ? m + ' דקות' : m === 60 ? 'שעה' : m / 60 + ' שעות'}</option>`).join('')}</select>
+          </label>
+          <label class="field"><span>משעה</span><input type="time" id="wFrom" value="${w.remind.from}"></label>
+          <label class="field"><span>עד שעה</span><input type="time" id="wTo" value="${w.remind.to}"></label>
+        </div>
+        <p class="muted" style="margin:10px 0 0;font-size:.85rem">התזכורת קופצת כשהאפליקציה פתוחה, ונעצרת כשמגיעים ליעד היומי. כל כוס שמוסיפים מאפסת את הטיימר.</p>
+        ${canNotify && Notification.permission === 'default' ? '<button class="btn ghost small" style="margin-top:10px" data-act="ask-notify">🔔 לאפשר התראות</button>' : ''}
+      </div>
+
+      <div class="card">
+        <h3>השבוע</h3>
+        <div class="bars">${week.map((d) => {
+          const v = w.log[d] || 0;
+          return `<div class="bar-col"><span class="v">${v || ''}</span><div class="bar ${v >= w.goal ? 'hit' : ''}" style="height:${(v / max) * 100}%"></div><span class="d">${DAYS[parseDay(d).getDay()]}</span></div>`;
+        }).join('')}</div>
+      </div>
+
+      <div class="card">
+        <h3>הגדרות</h3>
+        <form id="waterForm" class="row">
+          <label class="field"><span>יעד יומי (כוסות)</span><input type="number" name="goal" min="1" max="30" value="${w.goal}" inputmode="numeric"></label>
+          <label class="field"><span>גודל כוס (מ״ל)</span><input type="number" name="cup" min="50" max="1000" step="50" value="${w.cupMl}" inputmode="numeric"></label>
+          <button class="btn ghost" style="align-self:end">שמירה</button>
         </form>
       </div>`;
 
-    $('#habitForm').addEventListener('submit', (e) => {
-      e.preventDefault();
-      const name = e.target.name.value.trim();
-      if (!name) return;
-      state.habits.push({ id: uid(), name, emoji: e.target.emoji.value, done: [] });
+    const r = w.remind;
+    $('#wRemOn').addEventListener('change', async (e) => {
+      r.on = e.target.checked;
+      r.last = Date.now();
       save();
-      renderHabits();
-      toast('ההרגל נוסף');
-    });
-  }
-
-  // ---------- Reminders ----------
-  const REPEAT = { none: 'חד פעמי', daily: 'כל יום', weekly: 'כל שבוע' };
-
-  function defaultReminderTime() {
-    const d = new Date(Date.now() + 60 * 60 * 1000);
-    d.setMinutes(0, 0, 0);
-    return `${dayKey(d)}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
-  }
-
-  function renderReminders() {
-    const now = Date.now();
-    const open = state.reminders.filter((r) => !r.done).sort((a, b) => a.at - b.at);
-    const closed = state.reminders.filter((r) => r.done).sort((a, b) => b.at - a.at);
-    const canNotify = 'Notification' in window;
-    const perm = canNotify ? Notification.permission : 'unsupported';
-
-    const item = (r) => `
-      <li class="rem ${r.done ? 'done' : ''} ${!r.done && r.at < now ? 'overdue' : ''}">
-        <button class="tick" data-act="toggle-rem" data-id="${r.id}" aria-label="סימון כבוצע">${r.done ? '✓' : ''}</button>
-        <div class="grow">
-          <div class="title">${esc(r.title)}</div>
-          <div class="sub">${!r.done && r.at < now ? 'עבר זמנה · ' : ''}${fmtDateTime(r.at)} ${r.repeat !== 'none' ? `<span class="badge">🔁 ${REPEAT[r.repeat]}</span>` : ''}</div>
-        </div>
-        <button class="del" data-act="del-rem" data-id="${r.id}" aria-label="מחיקה">✕</button>
-      </li>`;
-
-    view.innerHTML = `
-      ${canNotify && perm === 'default' ? `
-        <div class="notice"><span>🔔 אפשר/י התראות כדי לקבל תזכורת בזמן</span><button class="btn small" data-act="ask-notify">הפעלה</button></div>` : ''}
-      ${perm === 'denied' ? '<div class="notice">ההתראות חסומות בדפדפן — התזכורות יוצגו כהודעה בתוך האפליקציה.</div>' : ''}
-
-      <div class="card">
-        <h3>תזכורת חדשה</h3>
-        <form id="remForm">
-          <input name="title" placeholder="על מה להזכיר?" required maxlength="80">
-          <div class="row" style="margin-top:8px">
-            <input name="at" type="datetime-local" value="${defaultReminderTime()}" required>
-            <select name="repeat">${Object.entries(REPEAT).map(([k, v]) => `<option value="${k}">${v}</option>`).join('')}</select>
-          </div>
-          <button class="btn" style="margin-top:8px;width:100%">+ הוספת תזכורת</button>
-        </form>
-      </div>
-
-      <div class="card">
-        <h3>פתוחות (${open.length})</h3>
-        ${open.length ? `<ul class="list">${open.map(item).join('')}</ul>` : '<p class="empty">אין תזכורות פתוחות 👌</p>'}
-      </div>
-
-      ${closed.length ? `
-      <div class="card">
-        <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:6px">
-          <h3 style="margin:0;flex:none">בוצעו (${closed.length})</h3>
-          <button class="btn ghost small" style="flex:none" data-act="clear-done">ניקוי</button>
-        </div>
-        <ul class="list">${closed.map(item).join('')}</ul>
-      </div>` : ''}`;
-
-    $('#remForm').addEventListener('submit', (e) => {
-      e.preventDefault();
-      const f = e.target;
-      const at = new Date(f.at.value).getTime();
-      if (!f.title.value.trim() || isNaN(at)) return;
-      state.reminders.push({ id: uid(), title: f.title.value.trim(), at, repeat: f.repeat.value, done: false, notified: false });
-      save();
-      renderReminders();
-      toast('התזכורת נשמרה');
-    });
-  }
-
-  function nextOccurrence(r) {
-    const days = r.repeat === 'daily' ? 1 : 7;
-    let at = r.at;
-    do { const d = new Date(at); d.setDate(d.getDate() + days); at = d.getTime(); } while (at <= Date.now());
-    return at;
-  }
-
-  function fireReminder(r) {
-    const body = fmtDateTime(r.at);
-    let shown = false;
-    if ('Notification' in window && Notification.permission === 'granted') {
-      try { new Notification('⏰ ' + r.title, { body, icon: 'icon.svg', tag: r.id }); shown = true; } catch (e) { /* mobile requires SW */ }
-      if (!shown && navigator.serviceWorker) {
-        navigator.serviceWorker.ready.then((reg) => reg.showNotification('⏰ ' + r.title, { body, icon: 'icon.svg', tag: r.id })).catch(() => {});
-        shown = true;
+      if (r.on && 'Notification' in window && Notification.permission === 'default') {
+        try { await Notification.requestPermission(); } catch (err) { /* ignore */ }
       }
-    }
-    toast('⏰ ' + r.title);
-    if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
+      toast(r.on ? `תזכורת מים כל ${$('#wEvery').selectedOptions[0].text}` : 'תזכורת המים כובתה');
+      renderWater();
+    });
+    $('#wEvery').addEventListener('change', (e) => { r.every = parseInt(e.target.value, 10); r.last = Date.now(); save(); });
+    $('#wFrom').addEventListener('change', (e) => { if (e.target.value) { r.from = e.target.value; save(); } });
+    $('#wTo').addEventListener('change', (e) => { if (e.target.value) { r.to = e.target.value; save(); } });
+    $('#waterForm').addEventListener('submit', (e) => {
+      e.preventDefault();
+      const g = parseInt(e.target.goal.value, 10), c = parseInt(e.target.cup.value, 10);
+      if (g > 0) w.goal = g;
+      if (c > 0) w.cupMl = c;
+      save(); renderWater(); toast('ההגדרות נשמרו');
+    });
   }
 
-  function checkReminders() {
-    const now = Date.now();
-    let changed = false;
-    state.reminders.forEach((r) => {
-      if (r.done || r.notified || r.at > now) return;
-      fireReminder(r);
-      if (r.repeat === 'none') r.notified = true;
-      else r.at = nextOccurrence(r);
-      changed = true;
+  function checkWater() {
+    const r = state.water.remind;
+    if (!r.on) return;
+    const now = new Date();
+    const mins = now.getHours() * 60 + now.getMinutes();
+    const from = toMin(r.from), to = toMin(r.to);
+    const inWindow = from <= to ? mins >= from && mins <= to : mins >= from || mins <= to;
+    if (!inWindow || waterToday() >= state.water.goal) return;
+    if (Date.now() - (r.last || 0) < r.every * 60000) return;
+    r.last = Date.now();
+    save();
+    notify('💧 זמן לשתות מים', `שתית ${waterToday()} מתוך ${state.water.goal} כוסות היום`, 'water');
+  }
+
+  // ---------- Account page ----------
+  function renderAccount() {
+    const u = account.user;
+    let body;
+    if (account.status === 'loading') {
+      body = '<p class="empty">מתחבר לחשבון…</p>';
+    } else if (account.status === 'connected' && u) {
+      const name = u.displayName || (u.email || '').split('@')[0];
+      body = `
+        <div class="profile">
+          ${u.photoURL ? '<img alt="" class="avatar" id="accAvatar" referrerpolicy="no-referrer">' : `<div class="avatar placeholder">${esc((name || '?').charAt(0).toUpperCase())}</div>`}
+          <div>
+            <div class="title" id="accName"></div>
+            <div class="sub" id="accEmail" dir="ltr" style="text-align:right"></div>
+            <div class="sub ok">☁️ מחובר/ת — הכל נשמר בחשבון</div>
+          </div>
+        </div>
+        <ul class="facts">
+          <li>הקלוריות, ההרגלים, המים והתזכורות נשמרים בחשבון ומסונכרנים בין כל המכשירים.</li>
+          <li>הנתונים פרטיים — רק את/ה רואה אותם.</li>
+        </ul>
+        <div class="sync-line muted">${account.error ? `<span style="color:var(--danger)">${esc(account.error)}</span>` : `סונכרן לאחרונה: ${new Date(account.lastSync).toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' })}`}</div>
+        <div class="row" style="margin-top:10px">
+          <button class="btn ghost" data-act="sync-now">🔄 סנכרון עכשיו</button>
+          <button class="btn ghost" data-act="logout">🚪 התנתקות</button>
+        </div>
+        <details class="danger-zone"><summary>מחיקת החשבון</summary>
+          <p class="muted tiny">פעולה זו מוחקת את החשבון ואת כל הנתונים השמורים בו לצמיתות.</p>
+          <button class="btn ghost danger small" data-act="delete-account">🗑️ מחיקת החשבון לצמיתות</button>
+        </details>`;
+    } else if (account.status === 'guest') {
+      const reg = authTab === 'register';
+      body = `
+        <div class="auth-head">
+          <div class="auth-logo">✓</div>
+          <h2>${reg ? 'יצירת חשבון חדש' : 'התחברות'}</h2>
+          <p class="muted">${reg ? 'חשבון חינמי — כל הנתונים נשמרים ומסונכרנים בין המכשירים' : 'התחברו כדי לגשת לנתונים שלכם מכל מכשיר'}</p>
+        </div>
+        <div class="seg" style="margin-bottom:12px">
+          <button class="${!reg ? 'on' : ''}" data-act="auth-tab" data-t="login">התחברות</button>
+          <button class="${reg ? 'on' : ''}" data-act="auth-tab" data-t="register">הרשמה</button>
+        </div>
+        <form id="authForm" class="auth-form">
+          ${reg ? '<label class="field"><span>שם</span><input name="name" autocomplete="name" maxlength="40" placeholder="איך לקרוא לך?" value="${esc(authName)}"></label>' : ''}
+          <label class="field"><span>מייל</span><input name="email" type="email" autocomplete="email" required dir="ltr" placeholder="name@example.com" value="${esc(authEmail)}"></label>
+          <label class="field"><span>סיסמה</span><input name="password" type="password" autocomplete="${reg ? 'new-password' : 'current-password'}" required minlength="6" dir="ltr" placeholder="${reg ? 'לפחות 6 תווים' : ''}"></label>
+          ${account.error ? `<p class="auth-error">${esc(account.error)}</p>` : ''}
+          <button class="btn" ${authBusy ? 'disabled' : ''}>${authBusy ? '…' : reg ? 'יצירת חשבון' : 'התחברות'}</button>
+          ${!reg ? '<button type="button" class="link-btn" data-act="reset-pw">שכחתי סיסמה</button>' : ''}
+        </form>
+        <div class="or"><span>או</span></div>
+        <button class="btn google-btn" data-act="google" ${authBusy ? 'disabled' : ''}><svg viewBox="0 0 48 48" width="18" height="18" aria-hidden="true"><path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3C33.7 32.7 29.3 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.9 1.2 8 3.1l5.7-5.7C34 6.1 29.3 4 24 4 12.9 4 4 12.9 4 24s8.9 20 20 20 20-8.9 20-20c0-1.3-.1-2.4-.4-3.5z"/><path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.7 15.1 19 12 24 12c3.1 0 5.9 1.2 8 3.1l5.7-5.7C34 6.1 29.3 4 24 4 16.3 4 9.7 8.3 6.3 14.7z"/><path fill="#4CAF50" d="M24 44c5.2 0 9.9-2 13.4-5.2l-6.2-5.2C29.2 35.1 26.7 36 24 36c-5.3 0-9.7-3.3-11.3-8l-6.5 5C9.5 39.6 16.2 44 24 44z"/><path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-.8 2.2-2.2 4.2-4.1 5.6l6.2 5.2C37 39.2 44 34 44 24c0-1.3-.1-2.4-.4-3.5z"/></svg> המשך עם Google</button>
+        <p class="muted tiny" style="text-align:center">בלי חשבון אפשר להמשיך להשתמש באתר — הנתונים יישמרו רק בדפדפן הזה.</p>`;
+    } else {
+      body = `
+        <div class="profile">
+          <div class="avatar placeholder">📱</div>
+          <div>
+            <div class="title">מצב מקומי</div>
+            <div class="sub">הנתונים נשמרים בדפדפן הזה</div>
+          </div>
+        </div>
+        ${account.status === 'unconfigured'
+          ? '<p class="muted tiny">מערכת החשבונות עוד לא הוגדרה באתר הזה. למנהל/ת האתר: יש למלא את הקובץ <code>firebase-config.js</code> (ההוראות ב־README).</p>'
+          : `<p style="color:var(--danger)">${esc(account.error)}</p>`}`;
+    }
+    view.innerHTML = `<div class="card">${body}</div>
+      <div class="card">
+        <h3>הנתונים שלי</h3>
+        <div class="stats">
+          <div><span class="muted">מאכלים שנרשמו</span><strong>${state.foods.length}</strong></div>
+          <div><span class="muted">הרגלים</span><strong>${state.habits.length}</strong></div>
+          <div><span class="muted">תזכורות</span><strong>${state.reminders.length}</strong></div>
+          <div><span class="muted">משימות</span><strong>${state.tasks.length}</strong></div>
+          <div><span class="muted">ימים עם מעקב מים</span><strong>${Object.keys(state.water.log).length}</strong></div>
+        </div>
+      </div>`;
+    if (u) {
+      const n = $('#accName'); if (n) n.textContent = u.displayName || (u.email || '').split('@')[0] || 'המשתמש שלי';
+      const em = $('#accEmail'); if (em) em.textContent = u.email || '';
+      const av = $('#accAvatar'); if (av) av.src = u.photoURL;
+    }
+    const f = $('#authForm');
+    if (f) f.addEventListener('input', () => { authEmail = f.email.value; if (f.name) authName = f.name.value; });
+    if (f) f.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const { auth, authM } = account.fb;
+      const email = f.email.value.trim(), pw = f.password.value;
+      await authRun(async () => {
+        if (authTab === 'register') {
+          const cred = await authM.createUserWithEmailAndPassword(auth, email, pw);
+          const nm = f.name && f.name.value.trim();
+          if (nm) { await authM.updateProfile(cred.user, { displayName: nm }); await cred.user.reload(); account.user = auth.currentUser; }
+          toast('החשבון נוצר — ברוכים הבאים! 🎉');
+        } else {
+          await authM.signInWithEmailAndPassword(auth, email, pw);
+          toast('התחברת בהצלחה 👋');
+        }
+      });
     });
-    if (changed) { save(); if (currentRoute() === 'reminders' || currentRoute() === '') render(); }
+  }
+  async function authRun(fn) {
+    authBusy = true; account.error = ''; render();
+    try { await fn(); } catch (e) { account.error = authError(e); }
+    authBusy = false; render();
+  }
+
+  function checkAll() {
+    habitsMod.check();
+    remMod.check();
+    checkWater();
   }
 
   // ---------- Global click actions ----------
@@ -378,36 +551,72 @@
     if (!btn) return;
     const id = btn.dataset.id;
     switch (btn.dataset.act) {
-      case 'prev-day': calDay = addDays(calDay, -1); renderCalories(); break;
-      case 'next-day': calDay = addDays(calDay, 1); renderCalories(); break;
-      case 'quick': addFood(btn.dataset.name, parseInt(btn.dataset.kcal, 10)); break;
-      case 'del-food':
-        state.foods = state.foods.filter((f) => f.id !== id); save(); renderCalories(); break;
-      case 'toggle-habit': {
-        const h = state.habits.find((x) => x.id === id);
-        const t = dayKey();
-        h.done = h.done.includes(t) ? h.done.filter((d) => d !== t) : [...h.done, t];
-        save(); renderHabits();
-        break;
-      }
-      case 'del-habit':
-        if (confirm('למחוק את ההרגל?')) { state.habits = state.habits.filter((h) => h.id !== id); save(); renderHabits(); }
-        break;
-      case 'toggle-rem': {
-        const r = state.reminders.find((x) => x.id === id);
-        r.done = !r.done;
-        if (!r.done && r.at > Date.now()) r.notified = false;
-        save(); renderReminders();
-        break;
-      }
-      case 'del-rem':
-        state.reminders = state.reminders.filter((r) => r.id !== id); save(); renderReminders(); break;
-      case 'clear-done':
-        state.reminders = state.reminders.filter((r) => !r.done); save(); renderReminders(); break;
       case 'ask-notify':
         try { await Notification.requestPermission(); } catch (err) { /* ignore */ }
-        renderReminders();
+        render();
         break;
+      case 'water-add': {
+        const t = dayKey();
+        state.water.log[t] = (state.water.log[t] || 0) + 1;
+        state.water.remind.last = Date.now();
+        save(); renderWater();
+        toast(state.water.log[t] === state.water.goal ? 'הגעת ליעד המים! 🎉' : '💧 +1 כוס');
+        break;
+      }
+      case 'water-sub': {
+        const t = dayKey();
+        state.water.log[t] = Math.max(0, (state.water.log[t] || 0) - 1);
+        save(); renderWater();
+        break;
+      }
+      case 'sync-now':
+        cloudDirty = true; lastCloudJson = ''; await flushCloud(); toast(account.error || 'סונכרן ☁️');
+        break;
+      case 'auth-tab': authTab = btn.dataset.t; account.error = ''; render(); break;
+      case 'google': {
+        const { auth, authM } = account.fb;
+        const provider = new authM.GoogleAuthProvider();
+        await authRun(async () => {
+          try { await authM.signInWithPopup(auth, provider); }
+          catch (err) {
+            if (err && (err.code === 'auth/popup-blocked' || err.code === 'auth/operation-not-supported-in-this-environment')) await authM.signInWithRedirect(auth, provider);
+            else throw err;
+          }
+        });
+        break;
+      }
+      case 'reset-pw': {
+        const f = $('#authForm');
+        const email = f && f.email.value.trim();
+        if (!email) { account.error = 'נא להזין את המייל בשדה למעלה ואז ללחוץ שוב'; render(); break; }
+        const { auth, authM } = account.fb;
+        await authRun(() => authM.sendPasswordResetEmail(auth, email));
+        if (!account.error) toast('שלחנו מייל לאיפוס הסיסמה 📧');
+        break;
+      }
+      case 'logout':
+        await account.fb.authM.signOut(account.fb.auth);
+        toast('התנתקת. הנתונים נשארו שמורים בחשבון');
+        break;
+      case 'delete-account': {
+        if (!confirm('למחוק את החשבון ואת כל הנתונים שבו לצמיתות? אי אפשר לבטל את זה.')) break;
+        const { auth, authM, fs } = account.fb;
+        try {
+          const ref = account.docRef;
+          if (account.unsub) { account.unsub(); account.unsub = null; }
+          account.docRef = null;
+          await fs.deleteDoc(ref);
+          try { localStorage.removeItem(localKey); } catch (err) { /* ignore */ }
+          await authM.deleteUser(auth.currentUser);
+          toast('החשבון נמחק');
+        } catch (err) {
+          // המחיקה לא הושלמה (למשל צריך התחברות מחודשת) — מחזירים את הנתונים לחשבון
+          if (auth.currentUser) { account.docRef = fs.doc(account.fb.db, 'users', auth.currentUser.uid); lastCloudJson = ''; save(); }
+          account.error = authError(err);
+          render();
+        }
+        break;
+      }
     }
   });
 
@@ -416,7 +625,8 @@
     navigator.serviceWorker.register('sw.js').catch(() => {});
   }
   render();
-  checkReminders();
-  setInterval(checkReminders, 20000);
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) { checkReminders(); render(); } });
+  initAccount();
+  checkAll();
+  setInterval(checkAll, 20000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) { checkAll(); render(); } });
 })();
