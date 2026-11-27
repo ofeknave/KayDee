@@ -111,7 +111,6 @@ window.CaloriesModule = function (ctx) {
               <span class="sub">${x.grams ? unitText(x) + ' · ' : ''}ח׳ ${fmt('p', n.p)} · פ׳ ${fmt('c', n.c)} · ש׳ ${fmt('f', n.f)}</span></span>
               <span class="kcal">${Math.round(n.kcal)}</span>
             </button>
-            <button class="del" data-cact="del-entry" data-id="${x.id}" aria-label="מחיקה">✕</button>
           </li>`;
         }).join('')}</ul>` : ''}
         <div class="meal-actions">
@@ -596,6 +595,7 @@ window.CaloriesModule = function (ctx) {
           <label class="field"><span>משקל בגרם</span><input name="ugrams" type="number" min="1" max="2000" value="${u ? u[1] : ''}" inputmode="numeric"></label>
         </div>
         <button class="btn" style="width:100%;margin-top:14px">${ed ? 'שמירה' : 'שמירה במאגר'}</button>
+        ${ed ? `<button type="button" class="btn ghost danger" style="width:100%;margin-top:8px" data-cact="del-custom" data-id="${ed.id}">🗑️ מחיקת המאכל מהמאגר</button>` : ''}
       </form>`;
     $('#customForm').addEventListener('submit', (e) => {
       e.preventDefault();
@@ -627,7 +627,7 @@ window.CaloriesModule = function (ctx) {
   }
 
   // ---------- actions ----------
-  function onAction(e) {
+  async function onAction(e) {
     const b = e.target.closest('[data-cact]');
     if (!b) return;
     const id = b.dataset.id;
@@ -646,7 +646,7 @@ window.CaloriesModule = function (ctx) {
       case 'edit-entry': {
         const en = st.foods.find((x) => x.id === id);
         if (en && en.foodId && findFood(en.foodId)) openSheet({ mode: 'food', foodId: en.foodId, entryId: en.id, meal: en.meal, unit: en.unit || 'גרם', qty: en.qty || en.grams });
-        else toast('אפשר רק למחוק פריט שנוסף בהוספה מהירה');
+        else if (en && await ctx.ask(`למחוק את "${en.name}" (${Math.round(nutr(en).kcal)} קק״ל) מהיומן?`, { ok: 'מחיקה', danger: true })) { st.foods = st.foods.filter((x) => x.id !== id); save(); rerender(); toast('נמחק מהיומן'); }
         break;
       }
       case 'close-sheet': closeSheet(); break;
@@ -684,7 +684,7 @@ window.CaloriesModule = function (ctx) {
       case 'new-custom': openSheet({ mode: 'custom', meal: sheet ? sheet.meal : guessMeal(), q: sheet ? sheet.q : foodsQ, back: !!sheet, fromFoods: !sheet }); break;
       case 'edit-custom': openSheet({ mode: 'custom', editId: id, meal: sheet.meal, fromFoods: sheet.fromFoods }); break;
       case 'del-custom':
-        if (confirm('למחוק את המאכל מהמאגר? (פריטים שכבר ביומן יישארו)')) {
+        if (await ctx.ask('למחוק את המאכל מהמאגר? (פריטים שכבר ביומן יישארו)', { ok: 'מחיקה', danger: true })) {
           st.customFoods = st.customFoods.filter((x) => x.id !== id);
           st.favorites = st.favorites.filter((x) => x !== id);
           save(); closeSheet(); rerender();

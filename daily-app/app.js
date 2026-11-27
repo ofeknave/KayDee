@@ -43,6 +43,18 @@
   const account = { status: 'loading', user: null, fb: null, docRef: null, unsub: null, lastSync: 0, error: '' };
   let cloudTimer = null, cloudWriting = false, cloudDirty = false, lastCloudJson = '';
   let authTab = 'login', authBusy = false, authEmail = '', authName = '';
+  // מצב תצוגה: pending (בטעינה) · full (הכל) · tasks (משימות בלבד — לכל מי שאינו בעל/ת האתר)
+  const fbConfigured = !!(window.FIREBASE_CONFIG && window.FIREBASE_CONFIG.apiKey);
+  const OWNER_EMAIL = String(window.SITE_OWNER_EMAIL || '').trim().toLowerCase();
+  let gate = window.parent !== window || (fbConfigured && OWNER_EMAIL) ? 'pending' : 'full';
+  const RESTRICTED_ROUTES = ['tasks', 'account'];
+  function setGate(g) {
+    gate = g;
+    document.body.classList.toggle('restricted', g === 'tasks');
+    if (g === 'tasks' && !RESTRICTED_ROUTES.includes(currentRoute())) history.replaceState(null, '', '#/tasks');
+  }
+  // באתר העצמאי: רק המייל שמוגדר כבעל/ת האתר מקבל את כל הפונקציות
+  const gateForUser = (u) => (!OWNER_EMAIL || (u && (u.email || '').toLowerCase() === OWNER_EMAIL) ? 'full' : 'tasks');
 
   function queueCloudSave() {
     if (!account.docRef) return;
@@ -58,7 +70,8 @@
     const ref = account.docRef;
     try {
       if (json !== lastCloudJson) {
-        await account.fb.fs.setDoc(ref, { json, updatedAt: Date.now() });
+        if (account.provider === 'claude') await ref.set({ json, updatedAt: Date.now() });
+        else await account.fb.fs.setDoc(ref, { json, updatedAt: Date.now() });
         lastCloudJson = json;
         account.lastSync = Date.now();
         account.error = '';
@@ -75,7 +88,10 @@
 
   async function initAccount() {
     const cfg = window.FIREBASE_CONFIG;
-    if (!cfg || !cfg.apiKey) { account.status = 'unconfigured'; refreshAccountUI(); return; }
+    if (!cfg || !cfg.apiKey) {
+      if (await initClaude()) return;
+      account.status = 'unconfigured'; refreshAccountUI(); return;
+    }
     try {
       const base = `https://www.gstatic.com/firebasejs/${FB_VER}/`;
       const [appM, authM, fs] = await Promise.all([import(base + 'firebase-app.js'), import(base + 'firebase-auth.js'), import(base + 'firebase-firestore.js')]);
@@ -83,6 +99,7 @@
       const auth = authM.getAuth(app);
       auth.languageCode = 'he';
       account.fb = { auth, authM, fs, db: fs.getFirestore(app) };
+      if (cfg.emulator) { authM.connectAuthEmulator(auth, `http://${cfg.emulator}:9099`, { disableWarnings: true }); fs.connectFirestoreEmulator(account.fb.db, cfg.emulator, 8089); } // לבדיקות מקומיות בלבד
       authM.getRedirectResult(auth).catch((e) => { account.error = authError(e); refreshAccountUI(); });
       authM.onAuthStateChanged(auth, onUser);
     } catch (e) {
@@ -92,7 +109,58 @@
     }
   }
 
+  // כשהאתר פתוח בתוך claude.ai (Artifact) — שמירה בחשבון Claude של המשתמש
+  async function initClaude() {
+    if (window.parent === window) { setGate('full'); return false; }
+    let c = window.claude;
+    for (let i = 0; i < 40 && !(c && typeof c.use === 'function'); i++) { await new Promise((r) => setTimeout(r, 250)); c = window.claude; }
+    if (!c || typeof c.use !== 'function') { setGate('full'); return false; }
+    const [user, db] = await Promise.all([c.use('user').catch(() => null), c.use('db').catch(() => null)]);
+    const me = user ? await user.me() : null;
+    // רק הבעלים של האפליקציה רואה את כל הפונקציות; כל השאר — רק משימות
+    setGate(me && me.isOwner ? 'full' : 'tasks');
+    if (!db || !me || !me.id) return false;
+    let canWrite = user && user.can ? await user.can('data.write') : null;
+    if (me.isOwner) canWrite = true; // הבעלים תמיד יכול לכתוב
+    if (canWrite == null) canWrite = me.canEdit ? true : null;
+    sharedSvc.start({ db, user, me: me.id, canWrite: canWrite !== false });
+    if (canWrite === false) { account.status = 'readonly'; refreshAccountUI(); render(); return true; } // צופה: המשימות האישיות נשמרות בדפדפן
+    account.provider = 'claude';
+    account.user = { claude: true, displayName: me.name || '', email: '', photoURL: me.avatarUrl };
+    account.docRef = db.doc('data/users/' + me.id + '/state');
+    localKey = BASE_KEY + ':' + me.id;
+    try {
+      const snap = await account.docRef.get();
+      const remote = snap.exists ? snap.data() : null;
+      if (remote && remote.json) {
+        lastCloudJson = remote.json;
+        state = normalize(JSON.parse(remote.json));
+        try { localStorage.setItem(localKey, remote.json); } catch (e) { /* ignore */ }
+      } else save();
+      account.status = 'connected';
+      account.lastSync = Date.now();
+      const ref = account.docRef;
+      ref.onSnapshot((sn) => {
+        const d = sn.exists ? sn.data() : null;
+        if (!d || !d.json || d.json === lastCloudJson || cloudDirty || cloudWriting) return;
+        lastCloudJson = d.json;
+        state = normalize(JSON.parse(d.json));
+        try { localStorage.setItem(localKey, d.json); } catch (e) { /* ignore */ }
+        account.lastSync = Date.now();
+        render();
+      }, () => {});
+    } catch (e) {
+      account.status = 'error';
+      account.error = 'לא הצלחנו לטעון את הנתונים מהחשבון — העבודה נשמרת בדפדפן';
+    }
+    render();
+    return true;
+  }
+
   async function onUser(u) {
+    setGate(gateForUser(u));
+    if (u) { fbShared.start({ fs: account.fb.fs, db: account.fb.db, uid: u.uid, name: u.displayName || (u.email || '').split('@')[0] }); modCtx.shared = fbShared; }
+    else fbShared.stop();
     if (account.unsub) { account.unsub(); account.unsub = null; }
     if (cloudDirty && account.docRef) { clearTimeout(cloudTimer); await flushCloud(); }
     account.user = u;
@@ -220,6 +288,31 @@
     try { if (navigator.vibrate && (!navigator.userActivation || navigator.userActivation.hasBeenActive)) navigator.vibrate([200, 100, 200]); } catch (e) { /* ignore */ }
   }
 
+  // ---------- In-app dialog (confirm()/prompt() are blocked inside claude.ai) ----------
+  function ask(message, opts = {}) {
+    return new Promise((resolve) => {
+      const wrap = document.createElement('div');
+      wrap.className = 'ask-wrap';
+      wrap.innerHTML = `<div class="ask" role="alertdialog" aria-modal="true">
+        <p class="ask-msg"></p>
+        ${opts.code ? `<input class="ask-code" readonly dir="ltr">` : ''}
+        <div class="ask-btns">
+          ${opts.code ? '' : `<button class="btn ghost" data-v="0">${opts.cancel || 'ביטול'}</button>`}
+          <button class="btn ${opts.danger ? 'danger-solid' : ''}" data-v="1">${opts.ok || 'אישור'}</button>
+        </div></div>`;
+      wrap.querySelector('.ask-msg').textContent = message;
+      const code = wrap.querySelector('.ask-code');
+      if (code) code.value = opts.code;
+      document.body.appendChild(wrap);
+      requestAnimationFrame(() => wrap.classList.add('open'));
+      const done = (v) => { wrap.remove(); document.removeEventListener('keydown', key, true); resolve(v); };
+      const key = (e) => { if (e.key === 'Escape') { e.stopPropagation(); done(false); } if (e.key === 'Enter') { e.preventDefault(); done(true); } };
+      document.addEventListener('keydown', key, true);
+      wrap.addEventListener('click', (e) => { const b = e.target.closest('[data-v]'); if (b) done(b.dataset.v === '1'); else if (e.target === wrap) done(false); });
+      if (code) { code.focus(); code.select(); } else wrap.querySelector('[data-v="1"]').focus();
+    });
+  }
+
   // ---------- Bottom sheet helper ----------
   function makeSheet(id, onAction, onClose) {
     let el = null;
@@ -245,9 +338,14 @@
 
   // ---------- Modules (calories.js, habits.js, reminders.js) ----------
   const modCtx = {
-    $, esc, uid, dayKey, addDays, parseDay, fmtDay, DAYS, toast, notify, makeSheet, view: $('#view'),
+    $, esc, uid, dayKey, addDays, parseDay, fmtDay, DAYS, toast, notify, makeSheet, ask, view: $('#view'),
     state: () => state, save: () => save(), render: () => render(),
   };
+  const sharedSvc = window.SharedLists(modCtx);
+  modCtx.shared = sharedSvc;
+  const fbShared = window.SharedListsFirebase(modCtx);
+  // מאפשר למודול המשימות להציע התחברות כדי להצטרף לרשימות משותפות
+  modCtx.canSignIn = () => !!(account.fb && !account.user);
   const cal = window.CaloriesModule(modCtx);
   const habitsMod = window.HabitsModule(modCtx);
   const remMod = window.RemindersModule(modCtx);
@@ -273,7 +371,8 @@
   }
   const subRoute = () => location.hash.replace(/^#\/?/, '').split('/')[1] || '';
   function render() {
-    const r = currentRoute();
+    if (gate === 'pending') { view.innerHTML = '<p class="empty" style="padding-top:40px">טוען…</p>'; return; }
+    const r = gate === 'tasks' && !RESTRICTED_ROUTES.includes(currentRoute()) ? 'tasks' : currentRoute();
     $('#pageTitle').textContent = routes[r].title;
     $('#backBtn').hidden = r === '';
     document.querySelectorAll('#tabbar a').forEach((a) => a.classList.toggle('active', a.dataset.route === r));
@@ -446,7 +545,7 @@
           <div>
             <div class="title" id="accName"></div>
             <div class="sub" id="accEmail" dir="ltr" style="text-align:right"></div>
-            <div class="sub ok">☁️ מחובר/ת — הכל נשמר בחשבון</div>
+            <div class="sub ok">☁️ מחובר/ת — הכל נשמר בחשבון${u.claude ? ' Claude שלך' : ''}</div>
           </div>
         </div>
         <ul class="facts">
@@ -456,12 +555,12 @@
         <div class="sync-line muted">${account.error ? `<span style="color:var(--danger)">${esc(account.error)}</span>` : `סונכרן לאחרונה: ${new Date(account.lastSync).toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' })}`}</div>
         <div class="row" style="margin-top:10px">
           <button class="btn ghost" data-act="sync-now">🔄 סנכרון עכשיו</button>
-          <button class="btn ghost" data-act="logout">🚪 התנתקות</button>
+          ${u.claude ? '' : '<button class="btn ghost" data-act="logout">🚪 התנתקות</button>'}
         </div>
-        <details class="danger-zone"><summary>מחיקת החשבון</summary>
+        ${u.claude ? '' : `<details class="danger-zone"><summary>מחיקת החשבון</summary>
           <p class="muted tiny">פעולה זו מוחקת את החשבון ואת כל הנתונים השמורים בו לצמיתות.</p>
           <button class="btn ghost danger small" data-act="delete-account">🗑️ מחיקת החשבון לצמיתות</button>
-        </details>`;
+        </details>`}`;
     } else if (account.status === 'guest') {
       const reg = authTab === 'register';
       body = `
@@ -524,7 +623,7 @@
         if (authTab === 'register') {
           const cred = await authM.createUserWithEmailAndPassword(auth, email, pw);
           const nm = f.name && f.name.value.trim();
-          if (nm) { await authM.updateProfile(cred.user, { displayName: nm }); await cred.user.reload(); account.user = auth.currentUser; }
+          if (nm) { await authM.updateProfile(cred.user, { displayName: nm }); await cred.user.reload(); account.user = auth.currentUser; fbShared.start({ fs: account.fb.fs, db: account.fb.db, uid: cred.user.uid, name: nm }); }
           toast('החשבון נוצר — ברוכים הבאים! 🎉');
         } else {
           await authM.signInWithEmailAndPassword(auth, email, pw);
@@ -599,7 +698,7 @@
         toast('התנתקת. הנתונים נשארו שמורים בחשבון');
         break;
       case 'delete-account': {
-        if (!confirm('למחוק את החשבון ואת כל הנתונים שבו לצמיתות? אי אפשר לבטל את זה.')) break;
+        if (!(await ask('למחוק את החשבון ואת כל הנתונים שבו לצמיתות? אי אפשר לבטל את זה.', { ok: 'מחיקה', danger: true }))) break;
         const { auth, authM, fs } = account.fb;
         try {
           const ref = account.docRef;

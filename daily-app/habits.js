@@ -287,6 +287,7 @@ window.HabitsModule = function (ctx) {
         <label class="field" style="margin-top:12px"><span>הערות / למה זה חשוב לי</span><textarea name="notes" rows="2" maxlength="300">${esc(d.notes)}</textarea></label>
       </form>
       <div class="sheet-foot row">
+        ${isNew ? '' : '<button class="btn ghost danger" data-hact="delete" style="flex:0 0 auto" aria-label="מחיקת ההרגל">🗑️ מחיקה</button>'}
         <button class="btn" data-hact="save-habit">${isNew ? 'יצירת הרגל' : 'שמירה'}</button>
       </div>`;
     const form = $('#hForm');
@@ -337,7 +338,7 @@ window.HabitsModule = function (ctx) {
   }
 
   // ---------- actions ----------
-  function onAction(e) {
+  async function onAction(e) {
     const b = e.target.closest('[data-hact]');
     if (!b) return;
     const t = dayKey();
@@ -390,7 +391,7 @@ window.HabitsModule = function (ctx) {
         toast(h.archived ? 'ההרגל הועבר לארכיון — ההיסטוריה נשמרת' : 'ההרגל חזר לרשימה');
         break;
       case 'delete':
-        if (confirm(`למחוק את "${h.name}" וכל ההיסטוריה שלו? (אפשר במקום זה להעביר לארכיון)`)) {
+        if (await ctx.ask(`למחוק את "${h.name}" וכל ההיסטוריה שלו? (אפשר במקום זה להעביר לארכיון)`, { ok: 'מחיקה', danger: true })) {
           S().habits = S().habits.filter((x) => x.id !== h.id); save(); sheet.close(); rerender(); toast('ההרגל נמחק');
         }
         break;

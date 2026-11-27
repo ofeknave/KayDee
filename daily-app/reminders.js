@@ -398,14 +398,14 @@ window.RemindersModule = function (ctx) {
         break;
       }
       case 'clear-done':
-        if (confirm('למחוק את כל התזכורות שבוצעו?')) { S().reminders = S().reminders.filter((x) => !x.done); save(); rerender(); }
+        { const n = S().reminders.filter((x) => x.done).length; if (n && await ctx.ask(`למחוק ${n} תזכורות שבוצעו?`, { ok: 'מחיקה', danger: true })) { S().reminders = S().reminders.filter((x) => !x.done); save(); rerender(); toast(`נמחקו ${n} תזכורות 🧹`); } }
         break;
       case 'ask-notify':
         try { await Notification.requestPermission(); } catch (err) { /* ignore */ }
         rerender();
         break;
       case 'delete':
-        if (confirm('למחוק את התזכורת?')) { S().reminders = S().reminders.filter((x) => x.id !== sh.id); save(); sheet.close(); rerender(); toast('נמחקה'); }
+        if (await ctx.ask('למחוק את התזכורת?', { ok: 'מחיקה', danger: true })) { S().reminders = S().reminders.filter((x) => x.id !== sh.id); save(); sheet.close(); rerender(); toast('נמחקה'); }
         break;
       case 'dup': {
         readForm($('#rForm'));
